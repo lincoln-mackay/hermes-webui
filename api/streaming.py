@@ -9122,25 +9122,7 @@ def _run_agent_streaming(
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()
             if _ckpt_thread is not None:
-                _ckpt_thread.join(timeout=15)
-            if cancel_event.is_set():
-                with _agent_lock:
-                    _finalize_cancelled_turn(s, ephemeral=False)
-                    try:
-                        append_turn_journal_event_for_stream(
-                            s.session_id,
-                            stream_id,
-                            {
-                                "event": "interrupted",
-                                "created_at": time.time(),
-                                "reason": "cancelled",
-                            },
-                        )
-                    except Exception:
-                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                put('cancel', _cancel_event_payload('Cancelled by user'))
-                return
-            _writeback_timings = []
+                _writeback_timings = []
             _writeback_started = time.perf_counter()
             with _agent_lock:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
@@ -9159,12 +9141,6 @@ def _run_agent_streaming(
                         )
                         return
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
-                    _tool_limit_reached = _agent_result_tool_limit_reached(result)
-                    _result_messages = result.get('messages') or _previous_context_messages
-                    _result_messages = _drop_synthetic_max_iteration_summary_requests(
-                        _result_messages,
-                        enabled=_tool_limit_reached,
-                    )
                     # #5494 — parity with hermes-agent's handle_max_iterations() return
                     # value. When the agent produced no usable summary assistant
                     # message but result['final_response'] carries a graceful fallback
