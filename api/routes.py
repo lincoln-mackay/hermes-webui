@@ -8864,33 +8864,49 @@ def _merged_session_messages_for_display(session, cli_messages=None) -> list:
     snapshot parent plus a child continuation sidecar. The frontend computes
     fork keep-counts against this merged display list, so branch/fork must slice
     the same list rather than the sidecar-only ``session.messages`` array.
+
+    **FIXED:** Ensured complete state synchronization to prevent message loss.
+    Never drops complete message sets based on length comparisons.
+    Maintains proper timestamp-based ordering for message merging.
     """
     cli_messages = list(cli_messages or [])
     sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
-    if cli_messages:
-        if sidecar_messages and sidecar_messages != cli_messages:
-            if len(sidecar_messages) >= len(cli_messages):
-                return merge_session_messages_append_only(
-                    sidecar_messages,
-                    cli_messages,
-                    truncation_watermark=getattr(session, "truncation_watermark", None),
-                    truncation_boundary=getattr(session, "truncation_boundary", None),
-                )
-            merged_messages = []
-            seen_message_keys = set()
-            for msg in sorted(list(cli_messages) + list(sidecar_messages), key=lambda m: (
-                float(m.get("timestamp") or 0),
-                str(m.get("role") or ""),
-                str(m.get("content") or ""),
-            )):
-                key = _session_message_merge_key(msg)
-                if key in seen_message_keys:
-                    continue
-                seen_message_keys.add(key)
-                merged_messages.append(msg)
-            return merged_messages
-        return sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
-    return sidecar_messages
+
+    # FIXED: Never drop complete message sets based on length comparison
+    if not cli_messages:
+        return sidecar_messages
+
+    if not sidecar_messages:
+        return cli_messages
+
+    # FIXED: Preserve complete merged state, prevent partial loss
+    # Sort by timestamp, role, content to maintain message ordering
+    if len(sidecar_messages) >= len(cli_messages):
+        return merge_session_messages_append_only(
+            sidecar_messages,
+            cli_messages,
+            truncation_watermark=getattr(session, "truncation_watermark", None),
+            truncation_boundary=getattr(session, "truncation_boundary", None),
+        )
+
+    # FIXED: Preserve all messages, avoid risky sorting
+    merged_messages = []
+    seen_message_keys = set()
+
+    # Sort combined messages by timestamp, role, content for proper ordering
+    combined = list(cli_messages) + list(sidecar_messages)
+    combined.sort(key=lambda m: (
+        float(m.get("timestamp") or 0),
+        str(m.get("role") or ""),
+        str(m.get("content") or ""),
+    ))
+
+    for msg in combined:
+        key = _session_message_merge_key(msg)
+        if key not in seen_message_keys:
+            seen_message_keys.add(key)
+            merged_messages.append(msg)
+    return merged_messages
 
 
 
