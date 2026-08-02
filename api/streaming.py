@@ -1149,6 +1149,62 @@ def _preferred_agent_display_name() -> str:
     return name or 'Hermes'
 
 
+def _is_silent_provider_turn(result, *, previous_context_messages, msg_text, agent) -> bool:
+    """Return True when a provider turn produced no new assistant reply and no error."""
+    if result is None:
+        return True
+    if not isinstance(result, dict):
+        return False
+    _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
+    if _last_err:
+        return False
+    _messages = result.get('messages') or []
+    if not isinstance(_messages, list):
+        return True
+    return not _assistant_reply_added_after_current_turn(
+        _messages,
+        previous_context_messages,
+        msg_text,
+    )
+
+
+def _run_conversation_with_silent_provider_retry(
+    agent,
+    *,
+    run_kwargs: dict,
+    previous_context_messages: list,
+    msg_text: str,
+    cancel_event,
+    flush_reasoning_buffer,
+    sleep_fn=time.sleep,
+    max_attempts: int = 3,
+    initial_delay: float = 1.0,
+):
+    """Retry a silent provider turn a few times without re-running the whole UI turn."""
+    last_result = {'messages': []}
+    for attempt in range(1, max_attempts + 1):
+        if cancel_event.is_set():
+            return last_result
+        try:
+            result = agent.run_conversation(**run_kwargs)
+        except Exception:
+            raise
+        if flush_reasoning_buffer is not None:
+            flush_reasoning_buffer()
+        last_result = result if result is not None else {'messages': []}
+        if not _is_silent_provider_turn(
+            last_result,
+            previous_context_messages=previous_context_messages,
+            msg_text=msg_text,
+            agent=agent,
+        ):
+            return last_result
+        if cancel_event.is_set() or attempt >= max_attempts:
+            return last_result
+        sleep_fn(initial_delay * attempt)
+    return last_result
+
+
 def _preferred_agent_display_name_for_session(session) -> str:
     profile = str(getattr(session, 'profile', '') or '').strip()
     if profile and profile != 'default':
@@ -9068,7 +9124,14 @@ def _run_agent_streaming(
                     cfg=_cfg,
                 )
                 _run_conversation_kwargs["user_message"] = user_message
-            result = agent.run_conversation(**_run_conversation_kwargs)
+            result = _run_conversation_with_silent_provider_retry(
+                agent,
+                run_kwargs=_run_conversation_kwargs,
+                previous_context_messages=_previous_context_messages,
+                msg_text=msg_text,
+                cancel_event=cancel_event,
+                flush_reasoning_buffer=_flush_reasoning_buffer,
+            )
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
