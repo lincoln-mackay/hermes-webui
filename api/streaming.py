@@ -1149,62 +1149,6 @@ def _preferred_agent_display_name() -> str:
     return name or 'Hermes'
 
 
-def _is_silent_provider_turn(result, *, previous_context_messages, msg_text, agent) -> bool:
-    """Return True when a provider turn produced no new assistant reply and no error."""
-    if result is None:
-        return True
-    if not isinstance(result, dict):
-        return False
-    _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
-    if _last_err:
-        return False
-    _messages = result.get('messages') or []
-    if not isinstance(_messages, list):
-        return True
-    return not _assistant_reply_added_after_current_turn(
-        _messages,
-        previous_context_messages,
-        msg_text,
-    )
-
-
-def _run_conversation_with_silent_provider_retry(
-    agent,
-    *,
-    run_kwargs: dict,
-    previous_context_messages: list,
-    msg_text: str,
-    cancel_event,
-    flush_reasoning_buffer,
-    sleep_fn=time.sleep,
-    max_attempts: int = 3,
-    initial_delay: float = 1.0,
-):
-    """Retry a silent provider turn a few times without re-running the whole UI turn."""
-    last_result = {'messages': []}
-    for attempt in range(1, max_attempts + 1):
-        if cancel_event.is_set():
-            return last_result
-        try:
-            result = agent.run_conversation(**run_kwargs)
-        except Exception:
-            raise
-        if flush_reasoning_buffer is not None:
-            flush_reasoning_buffer()
-        last_result = result if result is not None else {'messages': []}
-        if not _is_silent_provider_turn(
-            last_result,
-            previous_context_messages=previous_context_messages,
-            msg_text=msg_text,
-            agent=agent,
-        ):
-            return last_result
-        if cancel_event.is_set() or attempt >= max_attempts:
-            return last_result
-        sleep_fn(initial_delay * attempt)
-    return last_result
-
-
 def _preferred_agent_display_name_for_session(session) -> str:
     profile = str(getattr(session, 'profile', '') or '').strip()
     if profile and profile != 'default':
@@ -8038,6 +7982,7 @@ def _run_agent_streaming(
                 # first so the live Thinking stream is complete before/at the transition.
                 _flush_reasoning_buffer()
                 _token_sent = True
+                _emission_observed[0] = True  # emission guard: token observed
                 # Accumulate partial text so cancel_stream() can persist it (#893).
                 #
                 # STREAMS_LOCK contract for the three STREAM_* buffers (partial text,
@@ -8085,6 +8030,7 @@ def _run_agent_streaming(
                 # same sentence again inside a Thinking card.
                 if _is_visible_output_echo(reasoning_delta):
                     return
+                _emission_observed[0] = True  # emission guard: reasoning observed
                 # Accumulate into the current message's segment (#3587)
                 _reasoning_segments[_current_reasoning_idx] = (
                     _reasoning_segments.get(_current_reasoning_idx, '') + reasoning_delta
@@ -8125,6 +8071,7 @@ def _run_agent_streaming(
                 visible = str(text).strip()
                 if not visible:
                     return
+                _emission_observed[0] = True  # emission guard: interim assistant observed
                 reasoning_echo = _strip_reasoning_output_echo(visible)
                 already_streamed = bool(cb_kwargs.get('already_streamed', False)) or _is_visible_output_echo(visible)
                 payload = {
@@ -8212,6 +8159,7 @@ def _run_agent_streaming(
                         # Suppress those echoes like the dedicated reasoning callback.
                         if _is_visible_output_echo(reason_delta):
                             return
+                        _emission_observed[0] = True  # emission guard: reasoning available observed
                         # Accumulate into the current message's segment (#3587)
                         _reasoning_segments[_current_reasoning_idx] = (
                             _reasoning_segments.get(_current_reasoning_idx, '') + reason_delta
@@ -8249,6 +8197,7 @@ def _run_agent_streaming(
                         'name': name,
                         'args': args if isinstance(args, dict) else {},
                     })
+                    _emission_observed[0] = True  # emission guard: tool call observed
                     # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
                     # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
                     if stream_id in STREAM_LIVE_TOOL_CALLS:
@@ -8378,6 +8327,7 @@ def _run_agent_streaming(
                             'args': args if isinstance(args, dict) else {},
                             'tid': tool_call_id,
                         })
+                        _emission_observed[0] = True  # emission guard: tool call observed
                         # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
                         # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
                         if stream_id in STREAM_LIVE_TOOL_CALLS:
@@ -8406,6 +8356,7 @@ def _run_agent_streaming(
                     _record_live_tool_complete(tool_call_id, name, function_result)
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
                         _live_tool_event_complete_ids.add(tool_call_id)
+                        _emission_observed[0] = True  # emission guard: tool completion observed
                         result_snippet = _tool_result_snippet(function_result)
                         for live_tc in reversed(_live_tool_calls):
                             if live_tc.get('done'):
@@ -9124,14 +9075,65 @@ def _run_agent_streaming(
                     cfg=_cfg,
                 )
                 _run_conversation_kwargs["user_message"] = user_message
-            result = _run_conversation_with_silent_provider_retry(
-                agent,
-                run_kwargs=_run_conversation_kwargs,
-                previous_context_messages=_previous_context_messages,
-                msg_text=msg_text,
-                cancel_event=cancel_event,
-                flush_reasoning_buffer=_flush_reasoning_buffer,
-            )
+
+            # ── Silent-provider retry at provider boundary with emission guards ──
+            # Retry only when the provider returns no content AND no emission signal
+            # (token/reasoning/tool) has been observed. This avoids double-emit and
+            # state non-idempotency issues from whole-turn retries.
+            _max_silent_retries = 3
+            _silent_retry_delay = 1.0
+            _emission_observed = [False]  # mutable flag for closure
+
+            def _cancellation_aware_wait(delay: float) -> bool:
+                """Wait with cancellation checks. Returns True if cancelled."""
+                # Check cancellation before wait
+                if cancel_event.is_set():
+                    return True
+                # Use wait with timeout instead of time.sleep for cancellation awareness
+                if cancel_event.wait(timeout=delay):
+                    return True
+                # Check cancellation after wait
+                return cancel_event.is_set()
+
+            def _run_with_silent_retry():
+                last_result = {'messages': []}
+                for attempt in range(1, _max_silent_retries + 1):
+                    if cancel_event.is_set():
+                        return last_result
+                    # Reset emission flag for this attempt
+                    _emission_observed[0] = False
+                    try:
+                        result = agent.run_conversation(**_run_conversation_kwargs)
+                    except Exception:
+                        raise
+                    # #4729: flush reasoning buffer after each attempt
+                    _flush_reasoning_buffer()
+                    last_result = result if result is not None else {'messages': []}
+                    # Check if any emission occurred during this attempt
+                    if _emission_observed[0]:
+                        return last_result
+                    # Check if turn produced assistant content (not silent)
+                    _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
+                    if _last_err:
+                        return last_result
+                    _messages = result.get('messages') or []
+                    if not isinstance(_messages, list):
+                        return last_result
+                    if _assistant_reply_added_after_current_turn(
+                        _messages,
+                        _previous_context_messages,
+                        msg_text,
+                    ):
+                        return last_result
+                    # Silent turn - check if we should retry
+                    if cancel_event.is_set() or attempt >= _max_silent_retries:
+                        return last_result
+                    # Cancellation-aware wait before retry
+                    if _cancellation_aware_wait(_silent_retry_delay * attempt):
+                        return last_result
+                return last_result
+
+            result = _run_with_silent_retry()
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
